@@ -16,8 +16,16 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import sys
+from pathlib import Path
+
 import gymnasium as gym
 from prettytable import PrettyTable
+
+# 将项目根目录加入 sys.path，以便从 scripts/ 运行时能 import locowheeledlegged
+_project_root = Path(__file__).resolve().parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 # Import extensions to set up environment tasks
 from locowheeledlegged import *  # noqa: F401
@@ -27,7 +35,7 @@ def main():
     """Print all environments registered in `isaac.lab_demo` extension."""
     # print all the available environments
     table = PrettyTable(["S. No.", "Task Name", "Entry Point", "Config"])
-    table.title = "Available Environments in Isaac Lab Template Extension"
+    table.title = "LocoWheeledLegged 已注册任务"
     # set alignment of table columns
     table.align["Task Name"] = "l"
     table.align["Entry Point"] = "l"
@@ -37,7 +45,7 @@ def main():
     index = 0
     # acquire all Isaac environments names
     for task_spec in gym.registry.values():
-        if "Template-" in task_spec.id:
+        if "LocomotionGo2W" in task_spec.id:
             # add details to table
             table.add_row([index + 1, task_spec.id, task_spec.entry_point, task_spec.kwargs["env_cfg_entry_point"]])
             # increment count

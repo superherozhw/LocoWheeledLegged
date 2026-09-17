@@ -3,6 +3,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import sys
 
 from isaaclab.app import AppLauncher
 import cli_args
@@ -45,6 +46,12 @@ from isaaclab_rl.rsl_rl import (
     export_policy_as_jit,
     export_policy_as_onnx,
 )
+
+# 将项目根目录加入 sys.path，以便从 scripts/ 运行时能 import locowheeledlegged
+from pathlib import Path
+_project_root = Path(__file__).resolve().parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 # Import extensions to set up environment tasks
 from locowheeledlegged import *  # noqa: F401
