@@ -128,10 +128,12 @@ def custom_action_rate_l2_with_clip(
 ) -> torch.Tensor:
 
 
+    # 【修复】原实现用 `if torch.max(...) > threshold:` 判断是否需要裁剪：
+    #   1) 该判断会触发 GPU->CPU 同步（每个 env step 一次，每迭代 24 次，拖慢训练）
+    #   2) 触发时 print 刷屏（实测 1.3 分钟写 13MB 日志）
+    # torch.clamp 本身就是逐元素操作，无需先判断，结果完全等价。
     delta_action = env.action_manager.action - env.action_manager.prev_action
-    if torch.max(torch.abs(delta_action)) > threshold:
-        print(f"[WARN] custom_action_rate_l2_with_clip: delta_action exceeds threshold {threshold}!")
-        delta_action = torch.clamp(delta_action, min=-threshold, max=threshold)
+    delta_action = torch.clamp(delta_action, min=-threshold, max=threshold)
     pen = torch.sum(torch.square(delta_action), dim=1)
     return pen
 
