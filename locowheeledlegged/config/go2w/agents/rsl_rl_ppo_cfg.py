@@ -21,7 +21,7 @@ class LocomotionPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.01,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=3.0e-4,   # 【修复】1e-3 -> 3e-4，降低续训时分布突变导致的梯度爆炸风险
+        learning_rate=1.0e-3,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
