@@ -193,9 +193,31 @@ def main() -> None:
         runs = list_runs_newest_first()
         run_dir = runs[0] if runs else None
 
-    ckpt = newest_checkpoint(run_dir)
+    # --- 选择检查点:优先用 --checkpoint 指定的，否则自动选编号最大的 ---
+    # 注意: --checkpoint 由 cli_args.add_rsl_rl_args() 提供（和 play.py 一致）
+    pinned = None
+    if args_cli.checkpoint:
+        cand = args_cli.checkpoint
+        if not os.path.isabs(cand):
+            cand = os.path.join(run_dir, cand) if run_dir else cand
+        if os.path.isfile(cand):
+            pinned = os.path.abspath(cand)
+        else:
+            print(f"[WATCH] ⚠️ 指定的检查点不存在: {cand}")
+            avail = sorted(
+                (f for f in os.listdir(run_dir) if re.fullmatch(r"model_(\d+)\.pt", f)),
+                key=lambda f: int(re.findall(r"\d+", f)[0]),
+            ) if run_dir and os.path.isdir(run_dir) else []
+            print(f"[WATCH]    该目录可用: {', '.join(avail[:12])}{' ...' if len(avail) > 12 else ''}")
+            print("[WATCH]    回退到自动选编号最大的")
+
+    ckpt = pinned if pinned else newest_checkpoint(run_dir)
     print(f"[WATCH] 监视目录 : {run_dir}")
-    print(f"[WATCH] 初始检查点: {describe(ckpt)}")
+    if pinned:
+        print(f"[WATCH] 初始检查点: {describe(ckpt)}   [已用 --checkpoint 锁定]")
+        print("[WATCH]   锁定模式下不会自动切换到新检查点")
+    else:
+        print(f"[WATCH] 初始检查点: {describe(ckpt)}   [自动选编号最大的]")
 
     runner = OnPolicyRunner(
         env,
@@ -225,7 +247,7 @@ def main() -> None:
             if args_cli.watch_dir is None:
                 runs = list_runs_newest_first()
                 run_dir = runs[0] if runs else run_dir
-            cand = newest_checkpoint(run_dir)
+            cand = None if pinned else newest_checkpoint(run_dir)
             if cand and os.path.abspath(cand) != os.path.abspath(current_ckpt or ""):
                 try:
                     runner.load(cand)
