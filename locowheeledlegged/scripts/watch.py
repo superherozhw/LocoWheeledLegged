@@ -43,6 +43,11 @@ parser.add_argument("--reload_every", type=float, default=20.0,
                     help="每隔多少秒检查一次新检查点(默认 20)")
 parser.add_argument("--keep_training_commands", action="store_true", default=False,
                     help="保留训练时的指令分布(默认关闭 bang-bang / 强制站立指令，演示更容易看懂)")
+parser.add_argument("--static_camera", action="store_true", default=False,
+                    help="用静态相机代替跟随相机。跟随相机(asset_root)每帧都要从 GPU 读机器人位姿"
+                         "(GPU->CPU 同步)，容易拖慢 UI 导致窗口'无响应'；静态相机零每帧开销")
+parser.add_argument("--heartbeat", type=int, default=200,
+                    help="每渲染多少帧打印一次心跳，0=关闭(默认 200，约每 4 秒一次)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -120,16 +125,28 @@ def main() -> None:
     )
     agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
 
-    # --- 让相机跟着机器人，而不是死盯世界原点 ---
-    # 地形有 10x20 块 8m 瓦片，机器人会被随机分配到某块上，
-    # 默认 origin_type="world" 时相机看世界原点，根本看不到机器人。
+    # --- 相机设置 ---
+    # 地形是 num_rows x num_cols 块 8m 瓦片（默认 10x20 → 80m x 160m），机器人被随机
+    # 分配到某块上。默认 origin_type="world" 的相机看世界原点，机器人可能在 76m 外，
+    # 所以必须把相机移到机器人所在的瓦片附近。
+    #
+    #   asset_root（默认）: 相机每帧跟随机器人。但 ViewportCameraController 每帧都要
+    #                       从 GPU 读一次机器人位姿（GPU->CPU 同步），开销大，
+    #                       可能拖慢 UI 线程导致 GNOME 报"无响应"。
+    #   --static_camera   : 只在启动时把静态相机定位到机器人出生点，之后零每帧开销。
+    use_static = bool(args_cli.static_camera)
     try:
-        env_cfg.viewer.origin_type = "asset_root"
         env_cfg.viewer.eye = (3.0, 3.0, 2.0)
         env_cfg.viewer.lookat = (0.0, 0.0, 0.4)
         env_cfg.viewer.env_index = 0
         env_cfg.viewer.asset_name = "robot"
-        print("[WATCH] 相机已设为跟随机器人 (origin_type=asset_root)")
+        if use_static:
+            env_cfg.viewer.origin_type = "world"
+            print("[WATCH] 相机: 静态(world)，将在环境建好后定位到机器人出生点")
+        else:
+            env_cfg.viewer.origin_type = "asset_root"
+            print("[WATCH] 相机: 跟随机器人(asset_root)")
+            print("[WATCH]   若窗口出现'无响应'，改用 --static_camera")
     except Exception as exc:  # noqa: BLE001
         print(f"[WATCH] 相机设置失败，沿用配置默认值: {exc}")
 
@@ -148,6 +165,25 @@ def main() -> None:
     # --- 建环境 ---
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env)
+
+    # --- 静态相机:环境建好后才知道机器人出生点，此时把相机摆过去 ---
+    if use_static:
+        try:
+            import numpy as np
+
+            ctrl = getattr(env.unwrapped, "viewport_camera_controller", None)
+            if ctrl is None:
+                print("[WATCH] 未找到 viewport_camera_controller，静态相机定位跳过")
+            else:
+                origin = env.unwrapped.scene.env_origins[0].detach().cpu().numpy()
+                ctrl.cfg.origin_type = "world"       # 关键:world 模式下每帧回调不做任何事
+                ctrl.default_cam_eye = origin + np.array([3.0, 3.0, 2.0])
+                ctrl.default_cam_lookat = origin + np.array([0.0, 0.0, 0.4])
+                ctrl.update_view_to_world()
+                print(f"[WATCH] 静态相机已定位到出生点 {np.round(origin, 2).tolist()}")
+                print("[WATCH]   机器人跑远后可用鼠标中键拖拽视角，或重启脚本")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WATCH] 静态相机定位失败(不影响运行): {exc}")
 
     # --- 确定要监视的 run ---
     run_dir = args_cli.watch_dir
@@ -178,7 +214,9 @@ def main() -> None:
     current_ckpt = ckpt
     last_check = time.time()
     switched = 0
-    print(f"[WATCH] 就绪。每 {args_cli.reload_every:.0f} 秒检查一次新检查点，Ctrl+C 退出。")
+    frames = 0
+    print(f"[WATCH] 就绪。每 {args_cli.reload_every:.0f} 秒检查一次新检查点。")
+    print("[WATCH] 退出方式: 点窗口右上角的 × (Ctrl+C 会被 Isaac Sim 吞掉，无效)")
 
     while simulation_app.is_running():
         # --- 定期检查是否有新检查点 ---
@@ -204,6 +242,13 @@ def main() -> None:
         with torch.inference_mode():
             actions = policy(obs)
             obs, _, _, _ = env.step(actions)
+        frames += 1
+
+        # --- 心跳:避免"终端没输出 = 卡住了"的误解 ---
+        if args_cli.heartbeat > 0 and frames % args_cli.heartbeat == 0:
+            name = os.path.basename(current_ckpt) if current_ckpt else "无"
+            print(f"[WATCH] 运行中 | 已渲染 {frames} 帧 | 检查点 {name} | 已切换 {switched} 次",
+                  flush=True)
 
     env.close()
     print(f"[WATCH] 退出。共切换检查点 {switched} 次。")
