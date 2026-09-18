@@ -242,35 +242,15 @@ class ObservationsCfg:
 
 @configclass
 class ActionsCfg:
-    # ========================================================================
-    # 【实验B / 2026-09-18】收紧动作裁剪 + 加强低通滤波
-    #
-    # 问题: 用 model_10000 / model_14000 等后期检查点做演示时，Isaac Sim 窗口
-    #       被 GNOME 判定"无响应"；而用 model_999 等早期检查点则正常。
-    #       变量只有检查点 -> 是策略输出变得更极端所致。
-    #
-    # 根因: ① clip=±100 形同虚设。scale=0.25 时关节目标可达 ±25 rad（转 4 圈），
-    #          远超关节限位，PD 控制器持续输出极限力矩。
-    #       ② cut_off_frequency=5Hz -> α=0.4665，新值 47% 直接通过，滤波过弱，
-    #          策略的高频输出几乎原样送进物理引擎。
-    #       两者叠加使 PhysX/RTX 单帧耗时超过 GNOME 的 5 秒判定阈值。
-    #
-    # 注意: 动作裁剪与低通滤波都在"动作处理"阶段生效，对**推理**同样有效，
-    #       因此本改动无需重新训练即可验证效果（直接用旧检查点 play）。
-    #
-    # 回滚: git revert 本提交，或 git checkout HEAD~1 -- <本文件>
-    # ========================================================================
     leg_joint_pos = mdp.JointPositionLowPassActionCfg(
         asset_name="robot",
         joint_names=LEG_JOINT_NAMES,
         scale=0.25,
         use_default_offset=True,
-        # 原 (-100.0, 100.0)：关节目标限幅到 ±3 rad（物理上合理的活动范围）
-        clip={".*": (-3.0, 3.0)},
+        clip={".*": (-100.0, 100.0)},
         preserve_order=True,
         control_frequency=50.0,
-        # 原 5.0：α 由 0.4665 降到 0.1717，平滑强度约 3 倍
-        cut_off_frequency=1.5,
+        cut_off_frequency=5.0,
         order=1,
     )
     wheel_joint_vel = mdp.JointVelocityLowPassActionCfg(
@@ -278,11 +258,9 @@ class ActionsCfg:
         joint_names=WHEEL_JOINT_NAMES,
         scale=5.0,
         use_default_offset=True,
-        # 原 (-100.0, 100.0)：轮速目标限幅到 ±20 rad/s（执行器 velocity_limit=30）
-        clip={".*": (-20.0, 20.0)},
+        clip={".*": (-100.0, 100.0)},
         control_frequency=50.0,
-        # 原 15.0：α 由 0.8477 降到 0.4665
-        cut_off_frequency=5.0,
+        cut_off_frequency=15.0,
         order=1,
     )
 
@@ -557,7 +535,7 @@ class LocomotionEnvCfg(ManagerBasedRLEnvCfg):
     scene: SceneCfg = SceneCfg(num_envs=4096, env_spacing=2.5)
     viewer = ViewerCfg(
         eye=(5.0, 5.0, 4.0),
-        resolution=(960, 540),
+        resolution=(1920, 1080),
         lookat=(-2.0, -2.0, 0.0),
         origin_type="world",
         env_index=0,
