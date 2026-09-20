@@ -49,12 +49,22 @@ class PPO:
         symmetry_cfg: dict | None = None,
         clip_value_min: float | None = -5.0,
         clip_value_max: float | None = 10.0,
+        min_lr: float | None = None,
+        max_lr: float | None = None,
     ):
         self.device = device
 
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        # 自适应学习率的上下限。
+        # 原实现把 1e-5 / 1e-2 硬编码在 update() 里，与基准学习率脱钩：基准 1e-3 时下限只有
+        # 基准的 1/100，一旦撞上就等于停训（实测 97.5% 的 iteration 都停在下限）。
+        # 这里改成按基准学习率成比例，默认 [0.1x, 10x]；仍可用 min_lr / max_lr 显式覆盖。
+        self.min_lr = 0.1 * learning_rate if min_lr is None else min_lr
+        self.max_lr = 10.0 * learning_rate if max_lr is None else max_lr
+        # 上一次 update() 测到的平均 KL（供日志 / 诊断使用）
+        self.last_kl_mean: float | None = None
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
         # RND components
@@ -207,6 +217,10 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
+        # 自适应学习率用的 KL 累加器：循环内只测量，循环结束后统一调整一次
+        kl_sum = torch.zeros((), device=self.device)
+        kl_count = 0
+
         # iterate over batches
         for (
             obs_batch,
@@ -271,7 +285,8 @@ class PPO:
             sigma_batch = self.actor_critic.action_std[:original_batch_size]
             entropy_batch = self.actor_critic.entropy[:original_batch_size]
 
-            # KL
+            # KL（只测量并累加；学习率在本次 iteration 的循环结束后统一调整一次，
+            #     原因见循环后面那段注释）
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
@@ -281,15 +296,8 @@ class PPO:
                         - 0.5,
                         axis=-1,
                     )
-                    kl_mean = torch.mean(kl)
-
-                    if kl_mean > self.desired_kl * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                    kl_sum = kl_sum + torch.mean(kl)
+                    kl_count += 1
 
             # Surrogate loss
             # ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -408,6 +416,23 @@ class PPO:
                 mean_symmetry_loss += symmetry_loss.item()
             
             mean_value += value_batch.mean().item()
+
+        # -- 自适应学习率：每次 iteration 只调整一次
+        #
+        # 原实现把这段逻辑放在 mini-batch 循环内部，而每次 iteration 有
+        # num_learning_epochs x num_mini_batches = 5 x 4 = 20 次更新，于是单次 iteration 内
+        # 学习率最多变化 1.5^20 ≈ 3325 倍 —— 上下限（原本硬编码的 1e-5 / 1e-2）因此退化成两个
+        # 吸收态：实测 97.5% 的 iteration 停在下限 1e-5，等于停训。
+        # 论文 Algorithm 1 的语义是"策略更新之后按 KL 调整一次"，所以这里改为：用本次 iteration
+        # 全部 mini-batch 的平均 KL 调整一次，单次最大变化回到 1.5 倍。
+        if self.desired_kl is not None and self.schedule == "adaptive" and kl_count > 0:
+            self.last_kl_mean = float((kl_sum / kl_count).item())
+            if self.last_kl_mean > self.desired_kl * 2.0:
+                self.learning_rate = max(self.min_lr, self.learning_rate / 1.5)
+            elif self.last_kl_mean < self.desired_kl / 2.0 and self.last_kl_mean > 0.0:
+                self.learning_rate = min(self.max_lr, self.learning_rate * 1.5)
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches

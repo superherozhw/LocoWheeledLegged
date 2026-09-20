@@ -343,6 +343,9 @@ class OnPolicyRunner:
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/entropy", locs["mean_entropy"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+        # 自适应学习率实际测到的平均 KL（每次 iteration 一个值），用于诊断学习率行为
+        if getattr(self.alg, "last_kl_mean", None) is not None:
+            self.writer.add_scalar("Loss/kl_mean", self.alg.last_kl_mean, locs["it"])
         if self.alg.rnd:
             self.writer.add_scalar("Loss/rnd", locs["mean_rnd_loss"], locs["it"])
         if self.alg.symmetry:
