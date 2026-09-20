@@ -64,7 +64,13 @@ def command_axis_levels_vel(
     ema_name = f"_tracking_{axis_name}_ema"
     cmd_level_name = f"_command_{axis_name}_level"
 
-    if env.common_step_counter == 0:
+    # 只在属性还不存在时初始化。
+    # 原实现用 `env.common_step_counter == 0` 判断，而 common_step_counter 在每次进程启动时
+    # 都是 0（见 Isaac Lab 的 ManagerBasedRLEnv.__init__），所以每次 --resume 都会把课程
+    # 重置回起点，覆盖掉从 checkpoint 恢复的状态。改成 hasattr 后：
+    #   - 全新训练：属性不存在 → 正常初始化（行为不变）
+    #   - 续训：runner.load() 已恢复属性 → 跳过初始化，课程从上次的位置继续
+    if not hasattr(base_velocity, ema_name):
         # env._original_vel_x = torch.tensor(base_velocity_ranges.lin_vel_x, device=env.device)
         # env._initial_vel_x = env._original_vel_x * range_multiplier[0]
         # env._final_vel_x = env._original_vel_x * range_multiplier[1]

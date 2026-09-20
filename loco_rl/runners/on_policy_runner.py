@@ -18,6 +18,70 @@ from loco_rl.modules import *
 from loco_rl.utils import store_code_state
 
 
+# ---------------------------------------------------------------------------
+# 课程（curriculum）状态存取
+#
+# 背景：地形课程（`terrain.terrain_levels`）和命令课程（`command_axis_levels_vel` 写在命令项上的
+# `_command_*_level` / `_previous__command_*_level` / `_tracking_*_ema`）都是运行期状态，
+# 既不在模型权重里，也不在优化器状态里。原先的 `save()` 不保存它们，于是每次 `--resume`
+# 都会从头初始化：地形重置成"随机分布在偏难的行"（实测均值 ≈ 2.7~3.5），命令范围重置成起点 0.1。
+# 后果是把一台"只在平地上训练过"的机器人空降到陌生地形上，实测续训第一帧的摔倒（髋触地）
+# 比例高达 0.34~0.75，而正常训练时只有 0.18。
+#
+# 下面两个函数用鸭子类型在每个 env 上通用地抓取/写回这些张量，不依赖项目内的具体类。
+# ---------------------------------------------------------------------------
+
+_CURRICULUM_ATTR_PREFIXES = ("_command_", "_previous_", "_tracking_")
+
+
+def capture_curriculum_state(env) -> dict:
+    """抓取地形课程与命令课程的运行期状态，返回可直接 torch.save 的 CPU 张量字典。"""
+    state: dict = {}
+
+    terrain = getattr(getattr(env, "scene", None), "terrain", None)
+    levels = getattr(terrain, "terrain_levels", None)
+    if isinstance(levels, torch.Tensor):
+        state["terrain_levels"] = levels.detach().to("cpu").clone()
+
+    command_manager = getattr(env, "command_manager", None)
+    for name, term in getattr(command_manager, "_terms", {}).items():
+        for attr, value in vars(term).items():
+            if attr.startswith(_CURRICULUM_ATTR_PREFIXES) and isinstance(value, torch.Tensor):
+                state[f"command.{name}.{attr}"] = value.detach().to("cpu").clone()
+    return state
+
+
+def apply_curriculum_state(env, state: dict) -> bool:
+    """把 capture_curriculum_state 的结果写回 env；返回是否真的恢复过东西。"""
+    if not state:
+        return False
+    applied = False
+
+    terrain = getattr(getattr(env, "scene", None), "terrain", None)
+    levels = getattr(terrain, "terrain_levels", None)
+    saved_levels = state.get("terrain_levels")
+    if isinstance(levels, torch.Tensor) and isinstance(saved_levels, torch.Tensor) and levels.shape == saved_levels.shape:
+        levels[:] = saved_levels.to(levels.device)
+        # env_origins 是从 terrain_levels 派生的，必须同步重算，否则机器人仍会站在旧的行上
+        origins = getattr(terrain, "terrain_origins", None)
+        if origins is not None:
+            terrain.env_origins[:] = origins[levels, terrain.terrain_types]
+        applied = True
+
+    command_manager = getattr(env, "command_manager", None)
+    terms = getattr(command_manager, "_terms", {})
+    for key, value in state.items():
+        if not key.startswith("command."):
+            continue
+        _, term_name, attr = key.split(".", 2)
+        term = terms.get(term_name)
+        target = getattr(term, attr, None)
+        if isinstance(target, torch.Tensor) and target.shape == value.shape:
+            target[:] = value.to(target.device)
+            applied = True
+    return applied
+
+
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
@@ -390,6 +454,10 @@ class OnPolicyRunner:
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
+        # -- Save curriculum state (terrain levels / command levels)
+        # 不保存它的话，每次 --resume 都会把机器人空降到陌生的地形与命令范围上（见文件顶部说明）
+        raw_env = getattr(self.env, "unwrapped", self.env)
+        saved_dict["curriculum_state"] = capture_curriculum_state(raw_env)
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -427,6 +495,38 @@ class OnPolicyRunner:
             self.alg.actor_critic.reset_init_std()
         else:
             self.current_learning_iteration = loaded_dict["iter"]
+        # -- Restore curriculum state (terrain levels / command levels)
+        # 老 checkpoint 里没有这个键，此时跳过（等价于原来的行为）
+        curriculum_state = loaded_dict.get("curriculum_state")
+        if curriculum_state and not pretrained:
+            raw_env = getattr(self.env, "unwrapped", self.env)
+            if apply_curriculum_state(raw_env, curriculum_state):
+                # 恢复后 env_origins 变了，需要 reset 一次让机器人重新站到恢复后的地形行上。
+                # 但 Isaac Lab 的 env.reset() -> _reset_idx() 会顺带调用
+                # curriculum_manager.compute()（manager_based_rl_env.py:358），而此刻它算出的
+                # distance = ||机器人当前位置 - 新的 env_origins|| 是"横跨地形的距离"，
+                # 会被 terrain_levels_vel 误判成"走了很远"从而把地形等级错误地晋升一级
+                # （实测 2.9844 -> 3.8594，并把 env_origins 又改了回去）。
+                # 所以这里在 reset 期间临时屏蔽课程更新；reset 完成后立即还原，
+                # 之后课程仍按正常时机（episode 结束时）运行。
+                curriculum_manager = getattr(raw_env, "curriculum_manager", None)
+                original_compute = getattr(curriculum_manager, "compute", None)
+                try:
+                    if curriculum_manager is not None and original_compute is not None:
+                        curriculum_manager.compute = lambda *args, **kwargs: None
+                    self.env.reset()
+                finally:
+                    if curriculum_manager is not None and original_compute is not None:
+                        curriculum_manager.compute = original_compute
+                print(
+                    "[INFO] 已恢复课程状态: 地形等级均值 = "
+                    f"{float(curriculum_state['terrain_levels'].float().mean()):.3f}, "
+                    f"共 {len(curriculum_state)} 项"
+                )
+            else:
+                print("[WARN] checkpoint 里有 curriculum_state 但未能应用，本次将使用全新课程")
+        elif not pretrained:
+            print("[INFO] checkpoint 里没有课程状态（老格式），本次从全新课程开始")
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):
