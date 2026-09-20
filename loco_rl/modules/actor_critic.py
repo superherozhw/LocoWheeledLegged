@@ -105,18 +105,12 @@ class ActorCritic(nn.Module):
     def update_distribution(self, observations):
         # compute mean
         mean = self.actor(observations)
-        # 【修复】防止网络输出 NaN/Inf 传播到分布参数
-        # 原代码：clamp 无法拦住 NaN（torch.clamp(nan, ...) 仍返回 nan），
-        # 会导致 torch.normal 报 "expects all elements of std >= 0.0" 而崩溃。
-        mean = torch.nan_to_num(mean, nan=0.0, posinf=10.0, neginf=-10.0)
         # compute standard deviation
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
             std = torch.clamp(std, min=1e-6, max=5.0)
-            std = torch.nan_to_num(std, nan=1.0, posinf=5.0, neginf=1e-6)
         elif self.noise_std_type == "log":
             log_std = torch.clamp(self.log_std, min=-10.0, max=2.0)
-            log_std = torch.nan_to_num(log_std, nan=0.0, posinf=2.0, neginf=-10.0)
             std = torch.exp(log_std).expand_as(mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
